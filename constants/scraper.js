@@ -1,3 +1,4 @@
 module.exports = {
-  baseURL: 'https://komikstation.co'
+  baseURL: 'https://komiku.id'  // Ganti ke domain aktif
 }
+
