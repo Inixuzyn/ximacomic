@@ -1,228 +1,179 @@
 import * as cheerio from 'cheerio'
+import { join } from 'path'
 import { slugs } from '../constants/blacklist'
-import DOMAINS from '../constants/domains'
+import { baseURL } from '../constants/scraper'
 
-async function fetchWithTimeout(url, timeout = 8000) {
-  const controller = new AbortController()
-  const id = setTimeout(() => controller.abort(), timeout)
-  try {
-    const res = await fetch(url, { signal: controller.signal })
-    clearTimeout(id)
-    if (!res.ok) throw new Error(`HTTP ${res.status}`)
-    return await res.text()
-  } catch (err) {
-    clearTimeout(id)
-    throw err
-  }
+/**
+ * Mendapatkan konten HTML
+ * @param {string} path path/slug komik
+ */
+async function getHTML(path = '') {
+  const res = await fetch(join(baseURL, path))
+    .then((res) => res.text())
+    .catch(console.error)
+
+  return cheerio.load(res, null, false)
 }
 
-async function getHTML(baseURL, path = '') {
-  const url = new URL(path, baseURL).href
-  try {
-    const html = await fetchWithTimeout(url)
-    return cheerio.load(html)
-  } catch (err) {
-    console.warn(`[SCRAPER] Failed to fetch ${url}:`, err.message)
-    return null
-  }
-}
+/**
+ * Mendapatkan komik
+ * @param {object} query Query (ini akan dijadikan query string pada url)
+ * @param {number} maxResults Jumlah maksimal daftar komik yang dikembalikan (0 sampai 30)
+ * @return {array} Comics
+ */
+async function getComics(query = {}, maxResults = 30) {
+  const q = new URLSearchParams(query)
 
-function extractComics($, domain) {
+  const $ = await getHTML(!query.s ? `/manga?${q}` : `?${q}`) // Jika ada query `s` maka jangan gunakan route `/manga`
+
+  // Mengambil semua element dengan class `.bsx` yang ada di dalam `.mrgn > .listupd >.bs`
+  const comicCards = $(`.listupd > .bs > .bsx`)
+
+  // Comics
   const comics = []
-  const { config, baseURL } = domain
 
-  $(config.listSelector).each((i, el) => {
-    try {
-      const title = config.title(el, $) || 'Tanpa Judul'
-      if (!title || title === 'Tanpa Judul') return
+  comicCards.map((i, element) => {
+    const card = $(element)
+    const type = card.find('.type').text()
+    const title = card.find('a').attr('title')
+    const thumb = card.find('img').attr('src').replace('225', '160')
+    const details = card.find('a').attr('href').replace(baseURL, '')
+    const chapters = parseFloat(card.find('.epxs').text().replace('Ch.', ''))
+    const rating = parseFloat(card.find('.rating i').text())
 
-      const thumb = config.thumb(el, $) || ''
-      const details = config.details(el, $, baseURL)
-      const chapters = config.chapters(el, $)
-      const type = config.type(el, $)
-      const rating = config.rating(el, $)
-
-      const slug = details.split('/')[1] || ''
-      if (slugs.includes(slug)) return
-
-      comics.push({ type, title, thumb, details, chapters, rating })
-    } catch (e) {
-      console.warn(`[SCRAPER] Skip comic due to error:`, e.message)
-    }
+    comics.push({
+      type,
+      title,
+      thumb,
+      details,
+      chapters,
+      rating
+    })
   })
 
+  // Response
   return comics
+    .slice(0, max(maxResults))
+    .filter(({ details }) => !slugs.includes(details.split('/')[2]))
 }
 
-async function getComics(query = {}, maxResults = 30) {
-  const q = query.s?.trim() || ''
-  const limit = Math.min(Math.max(parseInt(maxResults) || 30, 1), 50)
-
-  for (const domain of DOMAINS) {
-    if (!domain.isActive) continue
-
-    try {
-      const path = q ? domain.config.searchPath(q) : domain.config.listPath
-      const $ = await getHTML(domain.baseURL, path)
-      if (!$) continue
-
-      const comics = extractComics($, domain)
-      if (comics.length > 0) {
-        console.log(`✅ Scraped ${comics.length} comics from ${domain.name}`)
-        return comics.slice(0, limit)
-      }
-    } catch (err) {
-      console.warn(`[DOMAIN ${domain.name}] Failed:`, err.message)
-    }
-  }
-
-  // Fallback: gabung semua (kalau partial success)
-  const allComics = []
-  for (const domain of DOMAINS) {
-    if (!domain.isActive) continue
-    try {
-      const path = q ? domain.config.searchPath(q) : domain.config.listPath
-      const $ = await getHTML(domain.baseURL, path)
-      if ($) {
-        const comics = extractComics($, domain)
-        allComics.push(...comics)
-      }
-    } catch {}
-  }
-
-  return allComics
-    .filter(c => c.title && c.title !== 'Tanpa Judul')
-    .slice(0, limit)
-}
-
+/**
+ * Menampilkan detail komik
+ * @param {string} path path komik (misal: `/[type]/[slug]`)
+ * @return {object} detail komik
+ */
 async function getDetailsComic(path) {
-  for (const domain of DOMAINS) {
-    if (!domain.isActive) continue
-    try {
-      const $ = await getHTML(domain.baseURL, path)
-      if (!$) continue
+  const $ = await getHTML(path)
 
-      // --- Komiku.id ---
-      if (domain.name === 'komiku') {
-        const $info = $('.infoz')
-        const $thumb = $('.ims img')
-        const $desc = $('.desc')
-        const $genres = $('.genre a')
-        const $chapters = $('#chapter_list > ul > li')
+  // Info komik
+  const info = $('.bigcontent')
 
-        const genres = []
-        $genres.each((i, el) => genres.push($(el).text().trim()))
+  // Genres
+  const genres = []
+  info.find('.spe span:nth-child(1) a').map((i, element) => {
+    const genre = $(element).text()
+    genres.push(genre)
+  })
 
-        const chapters = []
-        $chapters.each((i, el) => {
-          const $a = $(el).find('a')
-          chapters.push({
-            title: $a.text().trim(),
-            path: $a.attr('href')?.replace(domain.baseURL, '/read') || ''
-          })
-        })
+  //  Chapters
+  const chapters = []
+  $('.bixbox.bxcl > ul > li').map((i, element) => {
+    const chapter = $(element).find('.lchx a')
+    chapters.push({
+      title: chapter.text(),
+      path: chapter.attr('href').replace(baseURL, '/read')
+    })
+  })
 
-        const status = $info.text().match(/Status\s*:\s*([^\n]+)/i)?.[1] || 'Unknown'
-        const author = $info.text().match(/Author\s*:\s*([^\n]+)/i)?.[1] || 'Unknown'
-        const rating = parseFloat($('.rating strong').text()) || 0
-
-        return {
-          title: $thumb.attr('alt') || $('.entry-title').text().trim() || 'Tanpa Judul',
-          thumb: $thumb.attr('src') || '',
-          description: $desc.text().trim(),
-          genres,
-          status,
-          author,
-          rating,
-          chapters: chapters.reverse()
-        }
-      }
-
-      // --- Kiryuu.id / Shinigami.to / Sektekomik / Komikcast (mirip) ---
-      const $content = domain.name === 'komikcast' ? $('.infox') : $('.infox, .sor')
-      const $thumb = $('.thumb img, .ims img')
-      const $genres = $('.genre-info a, .wd-full span a')
-      const $chapters = $('.bixbox.bxcl ul li, .clstyle ul li, #chapter_list ul li')
-
-      const genres = []
-      $genres.each((i, el) => genres.push($(el).text().trim()))
-
-      const chapters = []
-      $chapters.each((i, el) => {
-        const $a = $(el).find('a')
-        const title = $a.text().trim()
-        const href = $a.attr('href')?.replace(domain.baseURL, '/read') || ''
-        if (title && href) chapters.push({ title, path: href })
-      })
-
-      let speText = $('.spe').text() + $('.imptdt').text()
-      if (!speText) speText = $('body').text()
-
-      const status = speText.match(/Status\s*[:：]?\s*([^\n,]+)/i)?.[1]?.trim() || 'Unknown'
-      const author = speText.match(/Author\s*[:：]?\s*([^\n,]+)/i)?.[1]?.trim() || 'Unknown'
-      const updated = speText.match(/Updated\s*[:：]?\s*([^\n,]+)/i)?.[1]?.trim() || ''
-      const rating = parseFloat($('.rating strong, .numvotes').text().match(/[\d.]+/)?.[0]) || 0
-
-      return {
-        title: $thumb.attr('alt') || $('.entry-title').text().trim() || 'Tanpa Judul',
-        thumb: $thumb.attr('src') || '',
-        description: $('.desc, .desc-content, .entry-content').text().trim(),
-        genres,
-        status,
-        author,
-        updatedOn: updated,
-        rating,
-        chapters: chapters.reverse()
-      }
-    } catch (err) {
-      console.warn(`[DETAIL ${domain.name}] Failed for ${path}:`, err.message)
-    }
+  // Info spesifik
+  const details = {
+    title: info.find('.thumb img').attr('alt'),
+    thumb: info.find('.thumb img').attr('src'),
+    description: info.find('span.desc p').text(),
+    genres,
+    status: info.find('.spe span:nth-child(2)').text().split(' ')[1],
+    released: info.find('.spe span:nth-child(3)').text().split(' ')[1],
+    author: info
+      .find('.spe span:nth-child(4)')
+      .text()
+      .split(' ')
+      .slice(1)
+      .join(' '),
+    type: info.find('.spe span:nth-child(5)').text().split(' ')[1],
+    serialization: info
+      .find('.spe span:nth-child(6)')
+      .text()
+      .split(' ')
+      .slice(1)
+      .join(' '),
+    postedBy: info
+      .find('.spe span:nth-child(7)')
+      .text()
+      .split(' ')
+      .slice(2)
+      .join(' '),
+    postedOn: info
+      .find('.spe span:nth-child(8)')
+      .text()
+      .split(' ')
+      .slice(2)
+      .join(' '),
+    updatedOn: info
+      .find('.spe span:nth-child(9)')
+      .text()
+      .split(' ')
+      .slice(2)
+      .join(' '),
+    rating: parseFloat($('.rating strong').text().split(' ')[1]),
+    chapters
   }
 
-  throw new Error('Tidak dapat mengambil detail komik dari semua domain')
+  // Response
+  return details
 }
 
+/**
+ * Mendapatkan halaman/gambar comic
+ * @param {string} path path komik (misal: `/read/[slug]`)
+ * @returns {array} pages
+ */
 async function getPagesOfComic(path) {
-  for (const domain of DOMAINS) {
-    if (!domain.isActive) continue
-    try {
-      const $ = await getHTML(domain.baseURL, path)
-      if (!$) continue
+  const $ = await getHTML(path)
 
-      let title = $('.entry-title').text().trim()
-      if (!title) title = $('title').text().replace(/–.+$/, '').trim()
+  // Title
+  const title = $('.headpost h1').text()
 
-      const pages = []
-      // Selector universal untuk area pembaca
-      $('#readerarea img, #chapter_body img, .img-responsive, .read-container img').each((i, el) => {
-        const src = $(el).attr('src')?.trim()
-        const dataSrc = $(el).attr('data-src')?.trim()
-        const url = src || dataSrc
-        if (url && !url.includes('blank') && !url.includes('placeholder')) {
-          pages.push(url)
-        }
-      })
+  // Pages
+  const pages = []
+  $('#readerarea img').map((i, element) => {
+    const image = $(element).attr('src')
+    pages.push(image)
+  })
 
-      // Pagination
-      let prev = null, next = null
-      if (domain.name === 'komiku') {
-        prev = $('.prev a').attr('href')?.replace(domain.baseURL, '/read') || null
-        next = $('.next a').attr('href')?.replace(domain.baseURL, '/read') || null
-      } else {
-        prev = $('.nav-links .prev a, .prevnext .prev a').attr('href')?.replace(domain.baseURL, '/read') || null
-        next = $('.nav-links .next a, .prevnext .next a').attr('href')?.replace(domain.baseURL, '/read') || null
-      }
+  // Pagination
+  const pagination = $('.nextprev')
+  const prev = pagination.find('[rel="prev"]').attr('href')
+  const next = pagination.find('[rel="next"]').attr('href')
 
-      if (pages.length > 0) {
-        console.log(`✅ Loaded ${pages.length} pages from ${domain.name}`)
-        return { title, pagination: { prev, next }, pages }
-      }
-    } catch (err) {
-      console.warn(`[PAGES ${domain.name}] Failed for ${path}:`, err.message)
-    }
+  // Response
+  return {
+    title,
+    pagination: {
+      prev: prev ? prev.replace(baseURL, '/read') : null,
+      next: next ? next.replace(baseURL, '/read') : null
+    },
+    pages
   }
+}
 
-  throw new Error('Tidak dapat memuat halaman komik dari semua domain')
+/**
+ * Mengatur jumlah maksimal daftar comic
+ * @param {number} num angka yang akan divalidasi
+ * @return {number}
+ */
+function max(num) {
+  const n = parseInt(num.length === 0 ? 30 : num)
+  return typeof n !== 'number' || n.toString() === 'NaN' ? 30 : n
 }
 
 module.exports = {
