@@ -1,4 +1,4 @@
 module.exports = {
-  baseURL: 'https://komiku.id'  // Ganti ke domain aktif
+  baseURL: 'https://08.shinigami.asia'  // Ganti ke domain aktif
 }
 
